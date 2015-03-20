@@ -14,8 +14,9 @@
 
 ;; Links to rfcs:
 ;; - http://tools.ietf.org/html/draft-ietf-oauth-json-web-token-32
-;; - http://tools.ietf.org/html/draft-ietf-jose-json-web-signature-40
-;; - https://tools.ietf.org/html/draft-ietf-jose-json-web-algorithms-40
+;; - http://tools.ietf.org/html/draft-ietf-jose-json-web-algorithms-40
+;; - http://tools.ietf.org/html/draft-ietf-jose-json-web-encryption-40
+;; - http://tools.ietf.org/html/draft-mcgrew-aead-aes-cbc-hmac-sha2-05
 
 (ns buddy.sign.jwe
   "Json Web Encryption."
@@ -34,6 +35,64 @@
            java.nio.ByteBuffer))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Crypto primitives/helpers.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defn- split-by-blocksize
+  "Split a byte array in blocksize blocks.
+  Given a arbitrary size bytearray and block size in bytes,
+  returns a lazy sequence of bytearray blocks of blocksize
+  size. If last block does not have enought data for fill
+  all block, it is padded using zerobyte padding."
+  [^bytes input ^long blocksize]
+  (let [inputsize (count input)]
+    (loop [cursormin 0
+           cursormax blocksize
+           remain inputsize
+           result []]
+      (cond
+        (= remain 0)
+        (conj result (byte-array blocksize))
+
+        (< remain blocksize)
+        (let [buffer (byte-array blocksize)]
+          (println input cursormin buffer 0 remain)
+          (System/arraycopy input cursormin buffer 0 remain)
+          (conj result buffer))
+
+        ;; (= remain blocksize)
+        ;; (let [buffer (byte-array blocksize)]
+        ;;   (System/arraycopy input cursormin buffer 0 remain)
+        ;;   (recur cursormax
+        ;;          (+ cursormax blocksize)
+        ;;          (- inputsize cursormax)
+        ;;          (conj result buffer)))
+
+        (>= remain blocksize)
+        (let [buffer (byte-array blocksize)]
+          (System/arraycopy input cursormin buffer 0 blocksize)
+          (recur cursormax
+                 (+ cursormax blocksize)
+                 (- inputsize cursormax)
+                 (conj result buffer)))))))
+
+(defn- encrypt
+  [input key iv]
+  (let [cipher (crypto/block-cipher :aes :cbc)
+        blocksize (crypto/get-block-size cipher)
+        blocks (split-by-blocksize input blocksize)]
+    (crypto/initialize! cipher {:op :encrypt :iv iv :key key})
+    (apply bytes/concat
+           (reduce (fn [acc block]
+                     (let [padnum (padding/count block :zerobyte)
+                           length (count block)]
+                       (when (> padnum 0)
+                         (padding/pad! block (- length padnum) :pkcs7))
+                       (let [eblock (crypto/process-block! cipher block)]
+                         (conj acc eblock))))
+                   [] blocks))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Implementation details
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -49,12 +108,12 @@
 
 (defn generate-header
   [{:keys [alg enc]}]
-  (->
-   {:alg (condp = alg
-           :dir "dir"
-           (str/upper-case (name alg)))
-    :enc (str/upper-case (name enc))}
-   (json/generate-string)))
+  (-> {:alg (condp = alg
+              :dir "dir"
+              (str/upper-case (name alg)))
+       :enc (str/upper-case (name enc))}
+      (json/generate-string)
+      (codecs/str->bytes)))
 
 (defmulti generate-iv :enc)
 (defmethod generate-iv :a128cbc-hs256 [_] (nonce/random-bytes 16))
@@ -76,63 +135,28 @@
     (.putLong buffer length)
     (.array buffer)))
 
+(defn- generate-ciphertext
+  [plaintext secret iv aad]
+  (let [ek (extract-encryption-key secret)
+    (encrypt plaintext ek iv)))
+
+(defn- generate-authtag
+  [ciphertext secret iv aad]
+  (let [al (calculate-aad-length aad)
+        mk (extract-authentication-key secret)
+        data (bytes/concat aad iv ciphertext al)
+        mac (hmac/hash data mk :sha256)]
+    ;; TODO: truncate depends on keysize
+    (bytes/slice mac 0 16)))
+
+(defn- generate-plaintext
+  [claims]
+  (-> (json/generate-string claims)
+      (codecs/str->bytes)))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Public Api
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-
-(defn split-by-blocksize
-  "Split a byte array in blocksize blocks.
-  Given a arbitrary size bytearray and block size in bytes,
-  returns a lazy sequence of bytearray blocks of blocksize
-  size. If last block does not have enought data for fill
-  all block, it is padded using zerobyte padding."
-  [^bytes input ^long blocksize]
-  (let [inputsize (count input)]
-    (loop [cursormin 0
-           cursormax blocksize
-           remain inputsize
-           result []]
-      (cond
-        (<= remain blocksize)
-        (let [buffer (byte-array blocksize)]
-          (println input cursormin buffer 0 remain)
-          (System/arraycopy input cursormin buffer 0 remain)
-          (conj result buffer))
-
-        (> remain blocksize)
-        (let [buffer (byte-array blocksize)]
-          (System/arraycopy input cursormin buffer 0 blocksize)
-          (recur cursormax
-                 (+ cursormax blocksize)
-                 (- inputsize cursormax)
-                 (conj result buffer)))))))
-
-(defn- encrypt*
-  [input key iv]
-  (let [cipher (crypto/block-cipher :aes :cbc)
-        blocksize (crypto/get-block-size cipher)
-        blocks (split-by-blocksize input blocksize)]
-    (crypto/initialize! cipher {:op :encrypt :iv iv :key key})
-    (apply bytes/concat
-           (reduce (fn [acc block]
-                     (let [padnum (padding/count block :zerobyte)]
-                       (when (> padnum 0)
-                         (padding/pad! block padnum :pkcs7))
-                       (conj acc (crypto/process-block! cipher block))))
-                   [] blocks))))
-
-(defn- encrypt
-  [secret iv plaintext aad]
-  (let [ek (extract-encryption-key secret)
-        mk (extract-authentication-key secret)
-        al (calculate-aad-length aad)
-        ciphertext (encrypt* plaintext secret iv)
-        _ (println 1111 aad iv ciphertext al)
-        data (bytes/concat aad iv ciphertext al)
-        mac (hmac/hash data mk :sha256)
-        tag (bytes/slice mac 0 16)]
-    [ciphertext tag]))
 
 (defn encode
   "Encrypt then sign arbitrary length string/byte array using
@@ -145,14 +169,15 @@
   (let [scek (generate-cek {:key key :alg alg})
         ecek (encrypt-cek {:cek scek :alg alg})
         iv (generate-iv {:enc enc})
-        header (codecs/str->bytes (generate-header {:alg alg :enc enc}))
-        plaintext (codecs/str->bytes (json/generate-string claims))
-        [ciphertext tag] (encrypt scek iv plaintext header)]
+        header (generate-header {:alg alg :enc enc})
+        plaintext (generate-plaintext claims)
+        ciphertext (generate-ciphertext plaintext scek iv header)
+        authtag (generate-authtag ciphertext scek iv header)]
     (str/join "." [(codecs/bytes->safebase64 header)
                    (codecs/bytes->safebase64 ecek)
                    (codecs/bytes->safebase64 iv)
                    (codecs/bytes->safebase64 ciphertext)
-                   (codecs/bytes->safebase64 tag)])))
+                   (codecs/bytes->safebase64 authtag)])))
 
 ;; (defn decode
 ;;   "Given a signed and encrypted message, verify it
